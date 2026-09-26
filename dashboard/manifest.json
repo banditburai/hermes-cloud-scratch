@@ -1,0 +1,13 @@
+{
+  "name": "hermes-cloud-scratch",
+  "label": "Scratch",
+  "description": "Personal test scaffolding — do not use.",
+  "icon": "FlaskConical",
+  "version": "0.0.1",
+  "tab": {
+    "path": "/hermes-cloud-scratch",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
