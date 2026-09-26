@@ -135,7 +135,11 @@ def _venv_test(package: str) -> dict:
     site = subprocess.run(
         [vpy, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
         capture_output=True, text=True).stdout.strip()
-    (Path(site) / "zz_hermes_sealed.pth").write_text(sysconfig.get_paths()["purelib"] + "\n")
+    # addsitedir (not a bare path) so the sealed venv's own .pth files run too — Hermes is an
+    # editable install whose import hook lives in one. Appended after this venv's site-packages,
+    # so packages installed here win on version conflicts.
+    (Path(site) / "zz_hermes_sealed.pth").write_text(
+        f"import site; site.addsitedir({sysconfig.get_paths()['purelib']!r})\n")
     steps.append({"pth": str(Path(site) / "zz_hermes_sealed.pth"), "points_to": sysconfig.get_paths()["purelib"]})
 
     uv = _find_uv()
