@@ -284,8 +284,12 @@ async def sidecar_stop():
 
 
 @router.post("/wheel")
-async def upload_wheel(request: Request, filename: str):
-    """Install an uploaded wheel into the scratch venv — keeps private packages off GitHub."""
+async def upload_wheel(request: Request, filename: str, deps: bool = True):
+    """Install an uploaded wheel into the scratch venv — keeps private packages off GitHub.
+
+    ``deps=false`` installs it alone: e.g. hermes-bridge must use the instance's own
+    hermes-agent (visible through the sealed-venv .pth), never a second copy from PyPI.
+    """
     if not filename.endswith(".whl") or "/" in filename or filename.startswith("."):
         return JSONResponse({"ok": False, "error": "filename must be a bare *.whl name"}, status_code=400)
     if not _VENV_PY.exists():
@@ -298,8 +302,10 @@ async def upload_wheel(request: Request, filename: str):
         return JSONResponse({"ok": False, "error": "wheel larger than 100 MB"}, status_code=413)
     target.write_bytes(data)
     uv = _find_uv()
-    argv = [uv, "pip", "install", "--python", str(_VENV_PY), "--reinstall-package",
-            filename.split("-")[0].replace("_", "-"), str(target)] if uv else [str(_VENV_PY), "-m", "pip", "install", str(target)]
+    no_deps = [] if deps else ["--no-deps"]
+    argv = [uv, "pip", "install", "--python", str(_VENV_PY), *no_deps, "--reinstall-package",
+            filename.split("-")[0].replace("_", "-"), str(target)] if uv else [
+            str(_VENV_PY), "-m", "pip", "install", *no_deps, str(target)]
     proc = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, timeout=600)
     return {"ok": proc.returncode == 0, "saved": str(target), "bytes": target.stat().st_size,
             "stdout": proc.stdout[-3000:], "stderr": proc.stderr[-3000:]}
