@@ -175,10 +175,41 @@ async def venv_test(package: str = "starhtml"):
 _VENV_PY = _SCRATCH / "venv" / "bin" / "python"
 _SIDECAR_APP = Path(__file__).resolve().parent.parent / "sidecar" / "app.py"
 _SIDECAR_LOG = _SCRATCH / "sidecar.log"
-_sidecar: dict = {"proc": None, "port": None, "argv": None}
+_sidecar: dict = {"proc": None, "port": None, "argv": None, "app": None}
 _sidecar_lock = asyncio.Lock()
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
                "transfer-encoding", "upgrade", "host", "content-length"}
+# Never forwarded from the client: credentials for the dashboard, and forwarding headers the
+# proxy sets itself (a client's own X-Forwarded-* would otherwise come first and win).
+_DROP = _HOP_BY_HOP | {"authorization", "cookie", "forwarded"}
+_WEB_PREFIX = "/api/plugins/hermes-cloud-scratch/web"
+_APP_COOKIE_STEM = "hermes_web"  # the sidecar only sees its own cookies, not the dashboard's
+
+
+def _public_web_url() -> str | None:
+    """Public URL of /web, from the dashboard's configured public URL — never from request headers."""
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    base = resolve_public_url() or os.environ.get("SCRATCH_PUBLIC_URL", "")
+    return f"{base.rstrip('/')}{_WEB_PREFIX}" if base else None
+
+
+def _sidecar_argv(app: str) -> list[str]:
+    match app:
+        case "demo":
+            return [str(_SIDECAR_APP)]
+        case "hermes-web":
+            if not (url := _public_web_url()):
+                raise ValueError("no public URL: set dashboard.public_url or SCRATCH_PUBLIC_URL")
+            return ["-m", "hermes_web", "--external-url", url]
+    raise ValueError(f"unknown app {app!r}; expected 'demo' or 'hermes-web'")
+
+
+def _app_cookies(header: str) -> str:
+    def name(pair: str) -> str:
+        return pair.strip().split("=", 1)[0].removeprefix("__Secure-").removeprefix("__Host-")
+
+    return "; ".join(p.strip() for p in header.split(";") if name(p).startswith(_APP_COOKIE_STEM))
 
 
 def _free_port() -> int:
@@ -195,12 +226,13 @@ def _sidecar_running() -> bool:
 
 def _sidecar_status() -> dict:
     proc = _sidecar["proc"]
-    return {"running": _sidecar_running(), "pid": proc.pid if proc else None,
+    return {"running": _sidecar_running(), "app": _sidecar["app"], "pid": proc.pid if proc else None,
             "returncode": proc.poll() if proc else None, "port": _sidecar["port"], "argv": _sidecar["argv"],
             "log_tail": _SIDECAR_LOG.read_text()[-1500:] if _SIDECAR_LOG.exists() else ""}
 
 
-async def _start_sidecar(argv_tail: list[str] | None = None) -> dict:
+async def _start_sidecar(app: str = "demo") -> dict:
+    argv_tail = _sidecar_argv(app)
     async with _sidecar_lock:
         if _sidecar_running():
             return _sidecar_status()
@@ -209,11 +241,11 @@ async def _start_sidecar(argv_tail: list[str] | None = None) -> dict:
             if not result.get("ok"):
                 return {"running": False, "error": "venv setup failed", "venv": result}
         port = _free_port()
-        argv = [str(_VENV_PY), *(argv_tail or [str(_SIDECAR_APP)]), "--port", str(port)]
+        argv = [str(_VENV_PY), *argv_tail, "--port", str(port)]
         log = open(_SIDECAR_LOG, "ab")
         proc = subprocess.Popen(argv, cwd=str(_SCRATCH), stdout=log, stderr=log, start_new_session=True,
                                 env={**os.environ, "PYTHONUNBUFFERED": "1"})
-        _sidecar.update(proc=proc, port=port, argv=argv)
+        _sidecar.update(proc=proc, port=port, argv=argv, app=app)
         for _ in range(100):  # up to ~20s for the port to accept
             if proc.poll() is not None:
                 break
@@ -232,8 +264,11 @@ async def sidecar_status():
 
 
 @router.post("/sidecar/start")
-async def sidecar_start():
-    return await _start_sidecar()
+async def sidecar_start(app: str = "demo"):
+    try:
+        return await _start_sidecar(app)
+    except ValueError as exc:
+        return JSONResponse({"running": False, "error": str(exc)}, status_code=400)
 
 
 @router.post("/sidecar/stop")
@@ -285,9 +320,14 @@ async def web_proxy(request: Request, path: str):
             return JSONResponse({"error": "sidecar not running", "status": status}, status_code=502)
     full = request.url.path
     prefix = full[: len(full) - len(path)].rstrip("/")
-    headers = [(k, v) for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP | {"authorization"}]
-    headers += [("x-forwarded-prefix", prefix), ("x-forwarded-host", request.headers.get("host", "")),
-                ("x-forwarded-proto", request.headers.get("x-forwarded-proto", request.url.scheme))]
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    headers = [(k, v) for k, v in request.headers.items()
+               if k.lower() not in _DROP and not k.lower().startswith("x-forwarded-")]
+    if cookies := _app_cookies(request.headers.get("cookie", "")):
+        headers.append(("cookie", cookies))
+    headers += [("x-forwarded-for", request.client.host if request.client else ""),
+                ("x-forwarded-prefix", prefix), ("x-forwarded-host", request.headers.get("host", "")),
+                ("x-forwarded-proto", proto)]
     url = f"http://127.0.0.1:{_sidecar['port']}/{path}"
     if request.url.query:
         url += "?" + request.url.query
@@ -302,7 +342,8 @@ async def web_proxy(request: Request, path: str):
     for k, v in upstream.headers.multi_items():
         if k.lower() in _HOP_BY_HOP:
             continue
-        if k.lower() == "location" and v.startswith("/"):
+        # Prefix-unaware apps get their redirects mapped; base-path-aware ones are left alone.
+        if k.lower() == "location" and v.startswith("/") and not (v == prefix or v.startswith(prefix + "/")):
             v = prefix + v
         out_headers.append((k, v))
 
