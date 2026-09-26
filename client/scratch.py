@@ -252,6 +252,11 @@ def main() -> None:
     s.add_argument("--count", type=int, default=5)
     v = sub.add_parser("venv-test")
     v.add_argument("package", nargs="?", default="starhtml")
+    h = sub.add_parser("http", help="authed request to a plugin path, e.g. `http POST sidecar/start`")
+    h.add_argument("method")
+    h.add_argument("path", help="relative to /api/plugins/hermes-cloud-scratch/")
+    h.add_argument("--data", help="request body, or @file to send a file")
+    h.add_argument("--stream", action="store_true", help="print the body as it arrives (SSE)")
     t = sub.add_parser("term")
     g = t.add_mutually_exclusive_group()
     g.add_argument("--tui", action="store_true", help="stock /api/pty (hermes --tui)")
@@ -281,6 +286,24 @@ def main() -> None:
         resp = _request(base, "POST", f"/api/plugins/{PLUGIN}/venv-test", params={"package": args.package}, timeout=600)
         print(resp.status_code)
         print(json.dumps(resp.json(), indent=2) if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:2000])
+    elif args.cmd == "http":
+        url = f"{base}/api/plugins/{PLUGIN}/{args.path.lstrip('/')}"
+        body = None
+        if args.data:
+            body = Path(args.data[1:]).read_bytes() if args.data.startswith("@") else args.data.encode()
+        headers = {"Authorization": f"Bearer {_access_token(base)}"}
+        started = time.time()
+        with httpx.stream(args.method.upper(), url, headers=headers, content=body, timeout=None,
+                          follow_redirects=False) as resp:
+            print(resp.status_code, resp.headers.get("content-type"), resp.headers.get("location") or "")
+            if args.stream:
+                for line in resp.iter_lines():
+                    if line:
+                        print(f"+{time.time() - started:5.2f}s  {line}")
+            else:
+                resp.read()
+                ctype = resp.headers.get("content-type", "")
+                print(json.dumps(resp.json(), indent=2) if ctype.startswith("application/json") else resp.text[:3000])
     elif args.cmd == "term":
         if args.tui:
             asyncio.run(term(base, "/api/pty", {}))

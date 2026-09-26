@@ -22,8 +22,8 @@ import sysconfig
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 _log = logging.getLogger("hermes-cloud-scratch")
 
@@ -127,6 +127,7 @@ def _venv_test(package: str) -> dict:
 
     venv = _SCRATCH / "venv"
     _SCRATCH.mkdir(parents=True, exist_ok=True)
+    # A previous run may have written the old bare-path .pth; always rewrite below.
     base_python = getattr(sys, "_base_executable", None) or sys.executable
     if not (venv / "bin" / "python").exists():
         if not run([base_python, "-m", "venv", "--without-pip", str(venv)]):
@@ -164,6 +165,160 @@ async def venv_test(package: str = "starhtml"):
     except Exception as exc:  # report, don't 500 — this is a probe
         _log.exception("venv-test failed")
         return {"ok": False, "error": repr(exc)}
+
+
+# --- sidecar process + reverse proxy ---------------------------------------------
+#
+# The only thing reachable from outside the container is the dashboard, so a separate
+# web process (eventually hermes-web) has to be served through this plugin's routes.
+
+_VENV_PY = _SCRATCH / "venv" / "bin" / "python"
+_SIDECAR_APP = Path(__file__).resolve().parent.parent / "sidecar" / "app.py"
+_SIDECAR_LOG = _SCRATCH / "sidecar.log"
+_sidecar: dict = {"proc": None, "port": None, "argv": None}
+_sidecar_lock = asyncio.Lock()
+_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
+               "transfer-encoding", "upgrade", "host", "content-length"}
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _sidecar_running() -> bool:
+    proc = _sidecar["proc"]
+    return proc is not None and proc.poll() is None
+
+
+def _sidecar_status() -> dict:
+    proc = _sidecar["proc"]
+    return {"running": _sidecar_running(), "pid": proc.pid if proc else None,
+            "returncode": proc.poll() if proc else None, "port": _sidecar["port"], "argv": _sidecar["argv"],
+            "log_tail": _SIDECAR_LOG.read_text()[-1500:] if _SIDECAR_LOG.exists() else ""}
+
+
+async def _start_sidecar(argv_tail: list[str] | None = None) -> dict:
+    async with _sidecar_lock:
+        if _sidecar_running():
+            return _sidecar_status()
+        if not _VENV_PY.exists():
+            result = await asyncio.to_thread(_venv_test, "starhtml")
+            if not result.get("ok"):
+                return {"running": False, "error": "venv setup failed", "venv": result}
+        port = _free_port()
+        argv = [str(_VENV_PY), *(argv_tail or [str(_SIDECAR_APP)]), "--port", str(port)]
+        log = open(_SIDECAR_LOG, "ab")
+        proc = subprocess.Popen(argv, cwd=str(_SCRATCH), stdout=log, stderr=log, start_new_session=True,
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        _sidecar.update(proc=proc, port=port, argv=argv)
+        for _ in range(100):  # up to ~20s for the port to accept
+            if proc.poll() is not None:
+                break
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                break
+            except OSError:
+                await asyncio.sleep(0.2)
+        return _sidecar_status()
+
+
+@router.get("/sidecar")
+async def sidecar_status():
+    return _sidecar_status()
+
+
+@router.post("/sidecar/start")
+async def sidecar_start():
+    return await _start_sidecar()
+
+
+@router.post("/sidecar/stop")
+async def sidecar_stop():
+    proc = _sidecar["proc"]
+    if _sidecar_running():
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            await asyncio.to_thread(proc.wait, 10)
+        if proc.poll() is None:
+            proc.kill()
+    return _sidecar_status()
+
+
+@router.post("/wheel")
+async def upload_wheel(request: Request, filename: str):
+    """Install an uploaded wheel into the scratch venv — keeps private packages off GitHub."""
+    if not filename.endswith(".whl") or "/" in filename or filename.startswith("."):
+        return JSONResponse({"ok": False, "error": "filename must be a bare *.whl name"}, status_code=400)
+    if not _VENV_PY.exists():
+        return JSONResponse({"ok": False, "error": "venv missing; POST /venv-test first"}, status_code=409)
+    wheels = _SCRATCH / "wheels"
+    wheels.mkdir(parents=True, exist_ok=True)
+    target = wheels / filename
+    data = await request.body()
+    if len(data) > 100 * 1024 * 1024:
+        return JSONResponse({"ok": False, "error": "wheel larger than 100 MB"}, status_code=413)
+    target.write_bytes(data)
+    uv = _find_uv()
+    argv = [uv, "pip", "install", "--python", str(_VENV_PY), "--reinstall-package",
+            filename.split("-")[0].replace("_", "-"), str(target)] if uv else [str(_VENV_PY), "-m", "pip", "install", str(target)]
+    proc = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, timeout=600)
+    return {"ok": proc.returncode == 0, "saved": str(target), "bytes": target.stat().st_size,
+            "stdout": proc.stdout[-3000:], "stderr": proc.stderr[-3000:]}
+
+
+@router.api_route("/web", methods=["GET", "HEAD"])
+async def web_root(request: Request):
+    return RedirectResponse(str(request.url.path) + "/", status_code=307)
+
+
+@router.api_route("/web/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def web_proxy(request: Request, path: str):
+    import httpx
+
+    if not _sidecar_running():
+        status = await _start_sidecar()
+        if not status.get("running"):
+            return JSONResponse({"error": "sidecar not running", "status": status}, status_code=502)
+    full = request.url.path
+    prefix = full[: len(full) - len(path)].rstrip("/")
+    headers = [(k, v) for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP | {"authorization"}]
+    headers += [("x-forwarded-prefix", prefix), ("x-forwarded-host", request.headers.get("host", "")),
+                ("x-forwarded-proto", request.headers.get("x-forwarded-proto", request.url.scheme))]
+    url = f"http://127.0.0.1:{_sidecar['port']}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None))
+    upstream_req = client.build_request(request.method, url, headers=headers, content=request.stream())
+    try:
+        upstream = await client.send(upstream_req, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        return JSONResponse({"error": f"upstream: {exc!r}"}, status_code=502)
+    out_headers = []
+    for k, v in upstream.headers.multi_items():
+        if k.lower() in _HOP_BY_HOP:
+            continue
+        if k.lower() == "location" and v.startswith("/"):
+            v = prefix + v
+        out_headers.append((k, v))
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response = StreamingResponse(body(), status_code=upstream.status_code)
+    response.raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in out_headers]
+    if "text/event-stream" in upstream.headers.get("content-type", ""):
+        response.raw_headers.append((b"x-accel-buffering", b"no"))
+    return response
 
 
 def _pty_argv(mode: str) -> list[str]:

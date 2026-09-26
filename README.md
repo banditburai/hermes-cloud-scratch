@@ -19,6 +19,9 @@ backend adds a few routes under `/api/plugins/hermes-cloud-scratch/`:
 | `GET  /sse` | Emit a few Server-Sent Events to check streaming survives the edge proxy |
 | `POST /venv-test` | Build a venv under `$HERMES_HOME` that can import Hermes, add a third-party package, and report whether both import |
 | `WS   /pty` | Terminal running `hermes chat --cli` (classic CLI, not the TUI) |
+| `GET  /sidecar`, `POST /sidecar/start`, `POST /sidecar/stop` | Manage a throwaway web process (`sidecar/app.py`) bound to 127.0.0.1 inside the container |
+| `ANY  /web/*` | Streaming reverse proxy to that process (HTTP + SSE); sends `X-Forwarded-Prefix` |
+| `POST /wheel?filename=…` | Install an uploaded wheel into the scratch venv (keeps private packages off GitHub). Behind the dashboard login; it installs and therefore runs arbitrary code, by design |
 
 All routes sit behind the dashboard's own auth gate (HTTP) or reuse the
 dashboard's WebSocket ticket gate (`/pty`). An optional `bash` shell on `/pty`
