@@ -196,6 +196,7 @@ async def upload_wheel(request: Request, filename: str, deps: bool = True):
 
 App = Literal["demo", "hermes-web"]
 _WEB_PREFIX = "/api/plugins/hermes-cloud-scratch/web"
+_ENTRY_TAB = "/hermes-cloud-scratch"  # manifest tab.path: the bookmarkable entry for /web
 _APP_COOKIE_STEM = "hermes_web"  # the sidecar only sees (and sets) its own cookies
 _SIDECAR_STATE = _SCRATCH / "sidecar.json"  # last started {app, pid}: survives restarts
 _SIDECAR_LOG = _SCRATCH / "sidecar.log"
@@ -229,20 +230,22 @@ def _http() -> httpx.AsyncClient:
     return httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(10.0, read=None))
 
 
-def _public_web_url() -> str | None:
-    """Public URL of /web, from the dashboard's configured public URL — never from request headers."""
+def _public_url() -> str | None:
+    """The dashboard's configured public URL — never from request headers."""
     from hermes_cli.dashboard_auth.prefix import resolve_public_url
 
     base = resolve_public_url() or os.environ.get("SCRATCH_PUBLIC_URL", "")
-    return f"{base.rstrip('/')}{_WEB_PREFIX}" if base else None
+    return base.rstrip("/") or None
 
 
 def _argv(app: App) -> list[str]:
     if app == "demo":
         return [str(Path(__file__).resolve().parents[1] / "sidecar" / "app.py")]
-    if not (url := _public_web_url()):
+    if not (url := _public_url()):
         raise ValueError("no public URL: set dashboard.public_url or SCRATCH_PUBLIC_URL")
-    return ["-m", "hermes_web", "--external-url", url]
+    # The hidden tab (dist/index.js) is an HTML route: an expired session there gets the
+    # dashboard's silent SSO, where /web (an API route) only gets a 401 hermes-web reacts to.
+    return ["-m", "hermes_web", "--external-url", f"{url}{_WEB_PREFIX}", "--reauth-url", f"{url}{_ENTRY_TAB}"]
 
 
 def _is_app_cookie(pair: str) -> bool:
