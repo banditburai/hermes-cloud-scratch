@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  Entry and re-auth page for the /web sidecar (hermes-web), served by the dashboard as a plugin
+  asset: /dashboard-plugins/hermes-cloud-scratch/web.html. Not under /api/, so an expired
+  session gets the dashboard's silent Portal SSO (API routes only get a 401 JSON) and returns
+  here with ?next intact; and not a dashboard SPA route, so none of the dashboard is drawn.
+  ?next=<path under /web/> (validated), else the /web/ root.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Hermes Web</title>
+<style>html { background: Canvas; }</style>
+<script>
+  (() => {
+    const ASSET = "/dashboard-plugins/hermes-cloud-scratch/web.html";
+    const WEB = "/api/plugins/hermes-cloud-scratch/web/";
+    // The dashboard may sit under a prefix: everything before the asset path.
+    const base = location.pathname.slice(0, location.pathname.lastIndexOf(ASSET));
+    const web = new URL(base + WEB, location.origin);
+    let target = web.pathname;
+    // Known loss: the dashboard's login round trip decodes next once more than it encodes it,
+    // so a next with several query params keeps only the first (hermes-web URLs carry at most one).
+    const next = new URLSearchParams(location.search).get("next");
+    if (next) {
+      try {
+        // Resolve, then check: rejects other origins, //host, "..", and paths outside /web/.
+        const url = new URL(next, web);
+        if (url.origin === web.origin && url.pathname.startsWith(web.pathname)) {
+          target = url.pathname + url.search + url.hash;
+        }
+      } catch {
+        /* malformed: the root */
+      }
+    }
+    location.replace(target);
+  })();
+</script>
+</head>
+<body>
+<noscript><a href="/api/plugins/hermes-cloud-scratch/web/">Open Hermes Web</a></noscript>
+</body>
+</html>

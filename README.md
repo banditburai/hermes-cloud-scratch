@@ -21,7 +21,7 @@ backend adds a few routes under `/api/plugins/hermes-cloud-scratch/`:
 | `WS   /pty` | Terminal running `hermes chat --cli` (classic CLI, not the TUI), or `?mode=shell` |
 | `GET  /sidecar`, `POST /sidecar/start?app=demo\|hermes-web`, `POST /sidecar/stop` | Manage the web process bound to 127.0.0.1 inside the container; the last started app resumes on the next `/web` request after a restart |
 | `ANY  /web/*` | Streaming reverse proxy to that process (HTTP + SSE); sends `X-Forwarded-Prefix` |
-| `/hermes-cloud-scratch?next=…` (dashboard page, not API) | Entry and re-auth page for `/web`: redirects to `next` (a path under `/web/`, else its root). A page route, so an expired session gets the dashboard's silent Portal sign-in; under `/api/` it only gets a 401 JSON, which hermes-web (started with `--reauth-url` pointing here) turns into a trip through this page. Bookmark this, not `/web/` |
+| `/dashboard-plugins/hermes-cloud-scratch/web.html?next=…` (static plugin asset) | Entry and re-auth page for `/web`: redirects to `next` (a path under `/web/`, else its root). Not under `/api/`, so an expired session gets the dashboard's silent Portal sign-in (under `/api/` it only gets a 401 JSON, which hermes-web, started with `--reauth-url` pointing here, turns into a trip through this page); not a dashboard SPA route, so none of the dashboard is drawn. Bookmark this. The hidden tab `/hermes-cloud-scratch` just forwards here |
 | `POST /wheel?filename=…` | Install an uploaded wheel into the scratch venv (keeps private packages off GitHub). Behind the dashboard login; it installs and therefore runs arbitrary code, by design |
 
 All routes sit behind the dashboard's own auth gate (HTTP) or reuse the

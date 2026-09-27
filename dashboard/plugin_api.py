@@ -196,7 +196,7 @@ async def upload_wheel(request: Request, filename: str, deps: bool = True):
 
 App = Literal["demo", "hermes-web"]
 _WEB_PREFIX = "/api/plugins/hermes-cloud-scratch/web"
-_ENTRY_TAB = "/hermes-cloud-scratch"  # manifest tab.path: the bookmarkable entry for /web
+_ENTRY = "/dashboard-plugins/hermes-cloud-scratch/web.html"  # dashboard/web.html: entry + re-auth
 _APP_COOKIE_STEM = "hermes_web"  # the sidecar only sees (and sets) its own cookies
 _SIDECAR_STATE = _SCRATCH / "sidecar.json"  # last started {app, pid}: survives restarts
 _SIDECAR_LOG = _SCRATCH / "sidecar.log"
@@ -243,9 +243,9 @@ def _argv(app: App) -> list[str]:
         return [str(Path(__file__).resolve().parents[1] / "sidecar" / "app.py")]
     if not (url := _public_url()):
         raise ValueError("no public URL: set dashboard.public_url or SCRATCH_PUBLIC_URL")
-    # The hidden tab (dist/index.js) is an HTML route: an expired session there gets the
-    # dashboard's silent SSO, where /web (an API route) only gets a 401 hermes-web reacts to.
-    return ["-m", "hermes_web", "--external-url", f"{url}{_WEB_PREFIX}", "--reauth-url", f"{url}{_ENTRY_TAB}"]
+    # web.html is outside /api/: an expired session there gets the dashboard's silent SSO,
+    # where /web (an API route) only gets a 401 that hermes-web answers by going there.
+    return ["-m", "hermes_web", "--external-url", f"{url}{_WEB_PREFIX}", "--reauth-url", f"{url}{_ENTRY}"]
 
 
 def _is_app_cookie(pair: str) -> bool:
