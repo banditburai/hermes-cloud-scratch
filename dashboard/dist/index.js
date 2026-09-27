@@ -6,24 +6,14 @@
   const TAB = "/hermes-cloud-scratch";
   const WEB = "/api/plugins/hermes-cloud-scratch/web/";
 
-  // `next` is the last parameter and taken whole: the dashboard's login round trip decodes it
-  // more often than it encodes it, so it comes back as a raw "/…/web/x?a=1&b=2" whose own
-  // "&" must not split it. One decode only if it still arrives encoded (e.g. a bookmark).
-  function nextParam() {
-    const raw = location.search.match(/[?&]next=(.*)$/)?.[1];
-    if (!raw) return null;
-    try {
-      return /^%2f/i.test(raw) ? decodeURIComponent(raw) : raw;
-    } catch {
-      return null;
-    }
-  }
-
   function target() {
     // The dashboard may itself sit under a prefix: everything before the tab path.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf(TAB));
     const web = new URL(base + WEB, location.origin);
-    const next = nextParam();
+    // The SPA normalises the query before this runs (re-encodes it, may add profile=), so the
+    // standard parse is right. Known loss: the dashboard's login round trip decodes next once
+    // more than it encodes it, so a next with several query params keeps only the first.
+    const next = new URLSearchParams(location.search).get("next");
     if (next) {
       try {
         // Resolve, then check: rejects other origins, //host, "..", and paths outside /web/.
