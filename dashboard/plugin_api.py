@@ -5,24 +5,30 @@ behind the dashboard auth middleware; the WebSocket route reuses the dashboard's
 own pre-accept gate (HTTP middleware does not run for WebSockets).
 """
 
-from __future__ import annotations
-
 import asyncio
 import contextlib
-import importlib
+import functools
 import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
 import platform
+import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import sysconfig
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+import anyio
+import httpx
+from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 _log = logging.getLogger("hermes-cloud-scratch")
@@ -31,6 +37,7 @@ router = APIRouter()
 
 _HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 _SCRATCH = _HOME / "scratch"
+_VENV_PY = _SCRATCH / "venv" / "bin" / "python"
 
 
 def _version(dist: str) -> str | None:
@@ -40,66 +47,50 @@ def _version(dist: str) -> str | None:
         return None
 
 
-def _importable(module: str) -> bool:
-    try:
-        importlib.import_module(module)
-        return True
-    except Exception:
-        return False
-
-
-def _writable(path: Path) -> bool:
-    return path.exists() and os.access(path, os.W_OK)
-
-
+@functools.cache
 def _find_uv() -> str | None:
-    found = shutil.which("uv")
-    if found:
+    if found := shutil.which("uv"):
         return found
-    for root in (Path("/opt/hermes/tools"), Path("/opt/hermes")):
-        if root.is_dir():
-            for candidate in root.rglob("uv"):
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    return str(candidate)
-    return None
+    roots = (Path("/opt/hermes/tools"), Path("/opt/hermes"))
+    candidates = (c for r in roots if r.is_dir() for c in r.rglob("uv"))
+    return next((str(c) for c in candidates if c.is_file() and os.access(c, os.X_OK)), None)
 
 
 @router.get("/probe")
 async def probe():
     try:
         from hermes_cli import __version__ as hermes_version
-    except Exception:
+    except ImportError:
         hermes_version = None
     disk = shutil.disk_usage(_HOME) if _HOME.exists() else None
-    mem_total = None
-    with contextlib.suppress(Exception):
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith(("MemTotal", "MemAvailable")):
-                mem_total = (mem_total or "") + line + "; "
+    meminfo = Path("/proc/meminfo")
     return {
         "hermes_version": hermes_version,
         "hermes_agent_dist": _version("hermes-agent"),
         "python": sys.version,
         "executable": sys.executable,
-        "purelib": sysconfig.get_paths()["purelib"],
+        "purelib": sysconfig.get_path("purelib"),
         "platform": platform.platform(),
         "uid": os.getuid(),
         "hermes_home": str(_HOME),
-        "writable": {p: _writable(Path(p)) for p in ("/opt/hermes", "/opt/hermes/.venv", str(_HOME), "/tmp")},
+        "writable": {p: os.access(p, os.W_OK) for p in ("/opt/hermes", "/opt/hermes/.venv", str(_HOME), "/tmp")},
         "which": {name: shutil.which(name) for name in ("hermes", "git", "bash", "node", "python3")},
         "uv": _find_uv(),
-        "importable": {m: _importable(m) for m in ("fastapi", "starlette", "ptyprocess", "starhtml", "hermes_bridge")},
+        "importable": {
+            m: importlib.util.find_spec(m) is not None
+            for m in ("fastapi", "starlette", "ptyprocess", "starhtml", "hermes_bridge")
+        },
         "versions": {d: _version(d) for d in ("fastapi", "starlette", "uvicorn", "pydantic", "rich")},
         "disk_free_gb": round(disk.free / 1e9, 2) if disk else None,
-        "meminfo": mem_total,
-        "env_flags": {k: os.environ.get(k) for k in ("SCRATCH_ALLOW_SHELL", "HERMES_WRITE_SAFE_ROOT", "HERMES_RUNTIME_DIR")},
+        "meminfo": "; ".join(
+            line for line in meminfo.read_text().splitlines() if line.startswith(("MemTotal", "MemAvailable"))
+        ) if meminfo.exists() else None,
     }
 
 
 @router.get("/sse")
 async def sse(count: int = 5, interval: float = 1.0):
-    count = max(1, min(count, 60))
-    interval = max(0.1, min(interval, 10.0))
+    count, interval = max(1, min(count, 60)), max(0.1, min(interval, 10.0))
 
     async def events():
         for i in range(count):
@@ -108,54 +99,46 @@ async def sse(count: int = 5, interval: float = 1.0):
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
-        events(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+# --- scratch venv ------------------------------------------------------------------
 
 
 def _venv_test(package: str) -> dict:
-    """Build $HERMES_HOME/scratch/venv that sees Hermes's sealed site-packages via a .pth,
-    install ``package`` into it, and check both import. Nothing under /opt/hermes is touched."""
+    """Build $HERMES_HOME/scratch/venv that sees Hermes's sealed site-packages, install
+    ``package`` into it, and check both import. Nothing under /opt/hermes is touched."""
     steps: list[dict] = []
 
     def run(argv: list[str], timeout: int = 240) -> bool:
-        started = time.time()
+        started = time.monotonic()
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         steps.append({
-            "argv": argv, "rc": proc.returncode, "secs": round(time.time() - started, 1),
-            "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:]})
+            "argv": argv, "rc": proc.returncode, "secs": round(time.monotonic() - started, 1),
+            "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:],
+        })  # fmt: skip
         return proc.returncode == 0
 
+    if not (mod := re.fullmatch(r"([A-Za-z0-9._-]+)(?:\[[^\]]*\])?(?:[<>=!~].*)?", package)):
+        return {"ok": False, "error": f"not a requirement: {package!r}"}
     venv = _SCRATCH / "venv"
     _SCRATCH.mkdir(parents=True, exist_ok=True)
-    # A previous run may have written the old bare-path .pth; always rewrite below.
-    base_python = getattr(sys, "_base_executable", None) or sys.executable
-    if not (venv / "bin" / "python").exists():
-        if not run([base_python, "-m", "venv", "--without-pip", str(venv)]):
-            return {"ok": False, "steps": steps}
-    vpy = str(venv / "bin" / "python")
-    site = subprocess.run(
-        [vpy, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
-        capture_output=True, text=True).stdout.strip()
-    # addsitedir (not a bare path) so the sealed venv's own .pth files run too — Hermes is an
-    # editable install whose import hook lives in one. Appended after this venv's site-packages,
-    # so packages installed here win on version conflicts.
-    (Path(site) / "zz_hermes_sealed.pth").write_text(
-        f"import site; site.addsitedir({sysconfig.get_paths()['purelib']!r})\n")
-    steps.append({"pth": str(Path(site) / "zz_hermes_sealed.pth"), "points_to": sysconfig.get_paths()["purelib"]})
+    if not _VENV_PY.exists() and not run([sys._base_executable, "-m", "venv", "--without-pip", str(venv)]):
+        return {"ok": False, "steps": steps}
+    # Same interpreter version, so the venv's site dir follows from the scheme. addsitedir (not a
+    # bare path) so the sealed venv's own .pth files run too — Hermes is an editable install whose
+    # import hook lives in one. Appended after this venv's site-packages, so ours win on conflicts.
+    sealed = sysconfig.get_path("purelib")
+    site = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+    (site / "zz_hermes_sealed.pth").write_text(f"import site; site.addsitedir({sealed!r})\n")
 
-    uv = _find_uv()
-    if uv:
-        ok = run([uv, "pip", "install", "--python", vpy, package])
-    else:
-        ok = run([vpy, "-m", "ensurepip"]) and run([vpy, "-m", "pip", "install", package])
-    mod = package.split("[")[0].split("=")[0].split("<")[0].split(">")[0].replace("-", "_")
-    check = (
-        "import importlib.metadata as m, json, hermes_cli, starlette\n"
-        f"import {mod}\n"
-        "print(json.dumps({'hermes_cli': hermes_cli.__file__, 'starlette': m.version('starlette'),"
-        f" '{mod}': getattr({mod}, '__version__', None)}}))")
-    imported = run([vpy, "-c", check], timeout=60)
-    return {"ok": ok and imported, "venv": str(venv), "steps": steps}
+    ok = run([uv, "pip", "install", "--python", str(_VENV_PY), package]) if (uv := _find_uv()) else (
+        run([str(_VENV_PY), "-m", "ensurepip"]) and run([str(_VENV_PY), "-m", "pip", "install", package])
+    )
+    name = mod[1].replace("-", "_")  # dist name; usually also the import name
+    check = f"import json, hermes_cli, {name}; print(json.dumps([hermes_cli.__file__, {name}.__file__]))"
+    return {"ok": ok and run([str(_VENV_PY), "-c", check], timeout=60), "venv": str(venv), "steps": steps}
 
 
 @router.post("/venv-test")
@@ -167,23 +150,83 @@ async def venv_test(package: str = "starhtml"):
         return {"ok": False, "error": repr(exc)}
 
 
-# --- sidecar process + reverse proxy ---------------------------------------------
+_MAX_WHEEL = 100 << 20
+
+
+@router.post("/wheel")
+async def upload_wheel(request: Request, filename: str, deps: bool = True):
+    """Install an uploaded wheel into the scratch venv — keeps private packages off GitHub.
+
+    ``deps=false`` installs it alone: e.g. hermes-bridge must use the instance's own
+    hermes-agent (visible through the sealed-venv .pth), never a second copy from PyPI.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", filename):
+        return JSONResponse({"ok": False, "error": "filename must be a bare *.whl name"}, status_code=400)
+    if not _VENV_PY.exists():
+        return JSONResponse({"ok": False, "error": "venv missing; POST /venv-test first"}, status_code=409)
+    if int(request.headers.get("content-length") or 0) > _MAX_WHEEL:
+        return JSONResponse({"ok": False, "error": "wheel larger than 100 MB"}, status_code=413)
+    target = _SCRATCH / "wheels" / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with target.open("wb") as f:
+        async for chunk in request.stream():
+            if (size := size + len(chunk)) > _MAX_WHEEL:
+                break
+            f.write(chunk)
+    if size > _MAX_WHEEL:
+        target.unlink()
+        return JSONResponse({"ok": False, "error": "wheel larger than 100 MB"}, status_code=413)
+    no_deps = [] if deps else ["--no-deps"]
+    argv = (
+        [uv, "pip", "install", "--python", str(_VENV_PY), *no_deps, "--reinstall-package", filename.split("-")[0]]
+        if (uv := _find_uv())
+        else [str(_VENV_PY), "-m", "pip", "install", "--force-reinstall", *no_deps]
+    )
+    proc = await asyncio.to_thread(subprocess.run, [*argv, str(target)], capture_output=True, text=True, timeout=600)
+    return {"ok": proc.returncode == 0, "saved": str(target), "bytes": target.stat().st_size,
+            "stdout": proc.stdout[-3000:], "stderr": proc.stderr[-3000:]}  # fmt: skip
+
+
+# --- sidecar process + reverse proxy -------------------------------------------------
 #
 # The only thing reachable from outside the container is the dashboard, so a separate
-# web process (eventually hermes-web) has to be served through this plugin's routes.
+# web process (hermes-web) is served through this plugin's /web routes. It is same-origin
+# with the dashboard: anything it serves runs with the dashboard's cookies in scope.
 
-_VENV_PY = _SCRATCH / "venv" / "bin" / "python"
-_SIDECAR_APP = Path(__file__).resolve().parent.parent / "sidecar" / "app.py"
-_SIDECAR_LOG = _SCRATCH / "sidecar.log"
-_sidecar: dict = {"proc": None, "port": None, "argv": None, "app": None}
-_sidecar_lock = asyncio.Lock()
-_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
-               "transfer-encoding", "upgrade", "host", "content-length"}
-# Never forwarded from the client: credentials for the dashboard, and forwarding headers the
-# proxy sets itself (a client's own X-Forwarded-* would otherwise come first and win).
-_DROP = _HOP_BY_HOP | {"authorization", "cookie", "forwarded"}
+App = Literal["demo", "hermes-web"]
 _WEB_PREFIX = "/api/plugins/hermes-cloud-scratch/web"
-_APP_COOKIE_STEM = "hermes_web"  # the sidecar only sees its own cookies, not the dashboard's
+_APP_COOKIE_STEM = "hermes_web"  # the sidecar only sees (and sets) its own cookies
+_SIDECAR_STATE = _SCRATCH / "sidecar.json"  # last started {app, pid}: survives restarts
+_SIDECAR_LOG = _SCRATCH / "sidecar.log"
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
+    "transfer-encoding", "upgrade",
+})  # fmt: skip
+# Never forwarded from the client: the dashboard's credentials, and forwarding headers the
+# proxy sets itself (a client's own X-Forwarded-* would otherwise come first and win).
+_DROP = _HOP_BY_HOP | {"host", "authorization", "cookie", "forwarded"}
+
+
+@dataclass(slots=True)
+class _Sidecar:
+    app: App | None = None
+    proc: subprocess.Popen | None = None
+    port: int | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+
+_sidecar = _Sidecar()
+_sidecar_lock = asyncio.Lock()
+
+
+@functools.cache
+def _http() -> httpx.AsyncClient:
+    # trust_env=False: an HTTP(S)_PROXY in the container must not capture loopback dials.
+    return httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(10.0, read=None))
 
 
 def _public_web_url() -> str | None:
@@ -194,255 +237,213 @@ def _public_web_url() -> str | None:
     return f"{base.rstrip('/')}{_WEB_PREFIX}" if base else None
 
 
-def _sidecar_argv(app: str) -> list[str]:
-    match app:
-        case "demo":
-            return [str(_SIDECAR_APP)]
-        case "hermes-web":
-            if not (url := _public_web_url()):
-                raise ValueError("no public URL: set dashboard.public_url or SCRATCH_PUBLIC_URL")
-            return ["-m", "hermes_web", "--external-url", url]
-    raise ValueError(f"unknown app {app!r}; expected 'demo' or 'hermes-web'")
+def _argv(app: App) -> list[str]:
+    if app == "demo":
+        return [str(Path(__file__).resolve().parents[1] / "sidecar" / "app.py")]
+    if not (url := _public_web_url()):
+        raise ValueError("no public URL: set dashboard.public_url or SCRATCH_PUBLIC_URL")
+    return ["-m", "hermes_web", "--external-url", url]
 
 
-def _app_cookies(header: str) -> str:
-    def name(pair: str) -> str:
-        return pair.strip().split("=", 1)[0].removeprefix("__Secure-").removeprefix("__Host-")
+def _is_app_cookie(pair: str) -> bool:
+    name = pair.strip().split("=", 1)[0].removeprefix("__Secure-").removeprefix("__Host-")
+    return name.startswith(_APP_COOKIE_STEM)
 
-    return "; ".join(p.strip() for p in header.split(";") if name(p).startswith(_APP_COOKIE_STEM))
+
+def _saved_state() -> dict:
+    with contextlib.suppress(FileNotFoundError, ValueError):
+        return json.loads(_SIDECAR_STATE.read_text())
+    return {}
+
+
+def _is_sidecar(pid: int) -> bool:
+    """A saved pid may since have been reused by an unrelated process: check it is ours."""
+    with contextlib.suppress(OSError):
+        return str(_VENV_PY).encode() in Path(f"/proc/{pid}/cmdline").read_bytes()
+    return False
+
+
+def _killpg(pid: int, sig: signal.Signals) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, sig)
+
+
+async def _terminate(pid: int, proc: subprocess.Popen | None = None) -> None:
+    """SIGTERM the sidecar's whole process group (hermes-web spawns workers), then SIGKILL."""
+    _killpg(pid, signal.SIGTERM)
+    if proc is not None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            await asyncio.to_thread(proc.wait, 10)
+    else:
+        await asyncio.sleep(2)
+    _killpg(pid, signal.SIGKILL)
 
 
 def _free_port() -> int:
-    import socket
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def _sidecar_running() -> bool:
-    proc = _sidecar["proc"]
-    return proc is not None and proc.poll() is None
+def _log_tail(n: int = 1500) -> str:
+    with contextlib.suppress(FileNotFoundError), _SIDECAR_LOG.open("rb") as f:
+        f.seek(max(0, f.seek(0, os.SEEK_END) - n))
+        return f.read().decode(errors="replace")
+    return ""
 
 
-def _sidecar_status() -> dict:
-    proc = _sidecar["proc"]
-    return {"running": _sidecar_running(), "app": _sidecar["app"], "pid": proc.pid if proc else None,
-            "returncode": proc.poll() if proc else None, "port": _sidecar["port"], "argv": _sidecar["argv"],
-            "log_tail": _SIDECAR_LOG.read_text()[-1500:] if _SIDECAR_LOG.exists() else ""}
+def _status() -> dict:
+    proc = _sidecar.proc
+    return {"running": _sidecar.running, "app": _sidecar.app, "pid": proc and proc.pid,
+            "returncode": proc and proc.poll(), "port": _sidecar.port, "argv": proc and proc.args,
+            "log_tail": _log_tail()}  # fmt: skip
 
 
-async def _start_sidecar(app: str = "demo") -> dict:
-    argv_tail = _sidecar_argv(app)
-    async with _sidecar_lock:
-        if _sidecar_running():
-            return _sidecar_status()
-        if not _VENV_PY.exists():
-            result = await asyncio.to_thread(_venv_test, "starhtml")
-            if not result.get("ok"):
-                return {"running": False, "error": "venv setup failed", "venv": result}
-        port = _free_port()
-        argv = [str(_VENV_PY), *argv_tail, "--port", str(port)]
-        log = open(_SIDECAR_LOG, "ab")
-        proc = subprocess.Popen(argv, cwd=str(_SCRATCH), stdout=log, stderr=log, start_new_session=True,
-                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
-        _sidecar.update(proc=proc, port=port, argv=argv, app=app)
-        for _ in range(100):  # up to ~20s for the port to accept
-            if proc.poll() is not None:
-                break
-            try:
-                _, writer = await asyncio.open_connection("127.0.0.1", port)
-                writer.close()
-                break
-            except OSError:
-                await asyncio.sleep(0.2)
-        return _sidecar_status()
+async def _stop_locked() -> None:
+    if _sidecar.running:
+        await _terminate(_sidecar.proc.pid, _sidecar.proc)
+    _sidecar.proc = None
+
+
+async def _start_locked(app: App) -> dict:
+    if _sidecar.running:
+        if _sidecar.app == app:
+            return _status()
+        await _stop_locked()
+    if (stale := _saved_state().get("pid")) and _sidecar.proc is None and _is_sidecar(stale):
+        await _terminate(stale)  # orphan from before a dashboard restart
+    argv = [str(_VENV_PY), *_argv(app), "--port", str(port := _free_port())]
+    with _SIDECAR_LOG.open("ab") as log:
+        proc = subprocess.Popen(argv, cwd=_SCRATCH, stdout=log, stderr=log, start_new_session=True,
+                                env=os.environ | {"PYTHONUNBUFFERED": "1"})  # fmt: skip
+    _sidecar.app, _sidecar.proc, _sidecar.port = app, proc, port
+    _SIDECAR_STATE.write_text(json.dumps({"app": app, "pid": proc.pid}))
+    for _ in range(100):  # up to ~20s for the port to accept
+        if proc.poll() is not None:
+            break
+        with contextlib.suppress(OSError):
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+            break
+        await asyncio.sleep(0.2)
+    return _status()
 
 
 @router.get("/sidecar")
 async def sidecar_status():
-    return _sidecar_status()
+    return _status()
 
 
 @router.post("/sidecar/start")
-async def sidecar_start(app: str = "demo"):
-    try:
-        return await _start_sidecar(app)
-    except ValueError as exc:
-        return JSONResponse({"running": False, "error": str(exc)}, status_code=400)
+async def sidecar_start(app: App = "demo"):
+    if not _VENV_PY.exists():
+        return JSONResponse({"running": False, "error": "venv missing; POST /venv-test first"}, status_code=409)
+    async with _sidecar_lock:
+        try:
+            return await _start_locked(app)
+        except ValueError as exc:
+            return JSONResponse({"running": False, "error": str(exc)}, status_code=400)
 
 
 @router.post("/sidecar/stop")
 async def sidecar_stop():
-    proc = _sidecar["proc"]
-    if _sidecar_running():
-        proc.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            await asyncio.to_thread(proc.wait, 10)
-        if proc.poll() is None:
-            proc.kill()
-    return _sidecar_status()
-
-
-@router.post("/wheel")
-async def upload_wheel(request: Request, filename: str, deps: bool = True):
-    """Install an uploaded wheel into the scratch venv — keeps private packages off GitHub.
-
-    ``deps=false`` installs it alone: e.g. hermes-bridge must use the instance's own
-    hermes-agent (visible through the sealed-venv .pth), never a second copy from PyPI.
-    """
-    if not filename.endswith(".whl") or "/" in filename or filename.startswith("."):
-        return JSONResponse({"ok": False, "error": "filename must be a bare *.whl name"}, status_code=400)
-    if not _VENV_PY.exists():
-        return JSONResponse({"ok": False, "error": "venv missing; POST /venv-test first"}, status_code=409)
-    wheels = _SCRATCH / "wheels"
-    wheels.mkdir(parents=True, exist_ok=True)
-    target = wheels / filename
-    data = await request.body()
-    if len(data) > 100 * 1024 * 1024:
-        return JSONResponse({"ok": False, "error": "wheel larger than 100 MB"}, status_code=413)
-    target.write_bytes(data)
-    uv = _find_uv()
-    no_deps = [] if deps else ["--no-deps"]
-    argv = [uv, "pip", "install", "--python", str(_VENV_PY), *no_deps, "--reinstall-package",
-            filename.split("-")[0].replace("_", "-"), str(target)] if uv else [
-            str(_VENV_PY), "-m", "pip", "install", *no_deps, str(target)]
-    proc = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, timeout=600)
-    return {"ok": proc.returncode == 0, "saved": str(target), "bytes": target.stat().st_size,
-            "stdout": proc.stdout[-3000:], "stderr": proc.stderr[-3000:]}
+    async with _sidecar_lock:
+        await _stop_locked()  # the saved app stays: /web resumes it after a restart
+    return _status()
 
 
 @router.api_route("/web", methods=["GET", "HEAD"])
 async def web_root(request: Request):
-    return RedirectResponse(str(request.url.path) + "/", status_code=307)
+    query = f"?{request.url.query}" if request.url.query else ""
+    return RedirectResponse(f"{request.url.path}/{query}", status_code=307)  # path-only: keeps the public origin
 
 
 @router.api_route("/web/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def web_proxy(request: Request, path: str):
-    import httpx
+    if not _sidecar.running:
+        # Only resume an app that was explicitly started before; a GET never builds venvs.
+        if not (app := _saved_state().get("app")) or not _VENV_PY.exists():
+            return JSONResponse({"error": "no sidecar; POST /sidecar/start?app=…"}, status_code=502)
+        async with _sidecar_lock:
+            status = _status() if _sidecar.running else await _start_locked(app)
+        if not status["running"]:
+            return JSONResponse({"error": "sidecar failed to start", "status": status}, status_code=502)
 
-    if not _sidecar_running():
-        status = await _start_sidecar()
-        if not status.get("running"):
-            return JSONResponse({"error": "sidecar not running", "status": status}, status_code=502)
-    full = request.url.path
-    prefix = full[: len(full) - len(path)].rstrip("/")
-    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    headers = [(k, v) for k, v in request.headers.items()
-               if k.lower() not in _DROP and not k.lower().startswith("x-forwarded-")]
-    if cookies := _app_cookies(request.headers.get("cookie", "")):
+    prefix = request.url.path.removesuffix(path).rstrip("/")
+    # Forward the raw (still percent-encoded) path so %2F, %3F and %23 survive.
+    raw_path = request.scope["raw_path"].removeprefix(prefix.encode()) or b"/"
+    if query := request.scope["query_string"]:
+        raw_path += b"?" + query
+    headers = [(k, v) for k, v in request.headers.items() if k not in _DROP and not k.startswith("x-forwarded-")]
+    if cookies := "; ".join(p.strip() for p in request.headers.get("cookie", "").split(";") if _is_app_cookie(p)):
         headers.append(("cookie", cookies))
-    headers += [("x-forwarded-for", request.client.host if request.client else ""),
-                ("x-forwarded-prefix", prefix), ("x-forwarded-host", request.headers.get("host", "")),
-                ("x-forwarded-proto", proto)]
-    url = f"http://127.0.0.1:{_sidecar['port']}/{path}"
-    if request.url.query:
-        url += "?" + request.url.query
-    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None))
-    upstream_req = client.build_request(request.method, url, headers=headers, content=request.stream())
+    headers += [
+        ("x-forwarded-for", request.client.host if request.client else ""),
+        ("x-forwarded-prefix", prefix),
+        ("x-forwarded-host", request.headers.get("host", "")),
+        ("x-forwarded-proto", request.headers.get("x-forwarded-proto", request.url.scheme)),
+    ]
+    upstream_req = _http().build_request(
+        request.method,
+        httpx.URL(f"http://127.0.0.1:{_sidecar.port}").copy_with(raw_path=raw_path),
+        headers=headers,
+        content=request.stream() if request.method not in {"GET", "HEAD"} else None,
+    )
     try:
-        upstream = await client.send(upstream_req, stream=True)
+        upstream = await _http().send(upstream_req, stream=True)
     except httpx.HTTPError as exc:
-        await client.aclose()
         return JSONResponse({"error": f"upstream: {exc!r}"}, status_code=502)
-    out_headers = []
-    for k, v in upstream.headers.multi_items():
-        if k.lower() in _HOP_BY_HOP:
+
+    out = []
+    for k, v in upstream.headers.raw:
+        if k in _HOP_BY_HOP or (k == b"set-cookie" and not _is_app_cookie(v.decode("latin-1"))):
             continue
         # Prefix-unaware apps get their redirects mapped; base-path-aware ones are left alone.
-        if k.lower() == "location" and v.startswith("/") and not (v == prefix or v.startswith(prefix + "/")):
-            v = prefix + v
-        out_headers.append((k, v))
+        if k == b"location" and v.startswith(b"/") and not (v == prefix.encode() or v.startswith(f"{prefix}/".encode())):
+            v = prefix.encode() + v
+        out.append((k, v))
+    if upstream.headers.get("content-type", "").startswith("text/event-stream"):
+        out.append((b"x-accel-buffering", b"no"))
 
     async def body():
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            with anyio.CancelScope(shield=True):  # close even when the client went away
+                await upstream.aclose()
 
     response = StreamingResponse(body(), status_code=upstream.status_code)
-    response.raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in out_headers]
-    if "text/event-stream" in upstream.headers.get("content-type", ""):
-        response.raw_headers.append((b"x-accel-buffering", b"no"))
+    response.raw_headers = out
     return response
 
 
-def _pty_argv(mode: str) -> list[str]:
+# --- terminal ------------------------------------------------------------------------
+
+
+def _pty_argv(mode: Literal["cli", "shell"]) -> list[str]:
     if mode == "shell":
         return [shutil.which("bash") or "/bin/sh", "-l"]
-    hermes = shutil.which("hermes")
-    base = [hermes] if hermes else [sys.executable, "-m", "hermes_cli.main"]
-    return [*base, "chat", "--cli"]
+    hermes = [h] if (h := shutil.which("hermes")) else [sys.executable, "-m", "hermes_cli.main"]
+    return [*hermes, "chat", "--cli"]
 
 
 @router.websocket("/pty")
-async def pty(ws: WebSocket, mode: str = "cli", cols: int = 120, rows: int = 32):
+async def pty(ws: WebSocket, mode: Literal["cli", "shell"] = "cli", cols: int = 120, rows: int = 32):
+    """A terminal on the instance: ``hermes chat --cli`` (the classic CLI) or a login shell.
+
+    Same trust as the rest of this plugin (and as the CLI agent's own shell tools)."""
     from hermes_cli.pty_bridge import PtyBridge
     from hermes_cli.web_routers.chat_ws import _ws_gate
-    from hermes_cli.web_server_chat import _RESIZE_RE
+    from hermes_cli.web_server_chat import _legacy_pump
 
-    gate = await _ws_gate(ws, "pty")
-    if gate is None:
-        return
-    if mode not in {"cli", "shell"}:
-        await ws.close(code=4400, reason="mode must be cli or shell")
-        return
-    if mode == "shell" and os.environ.get("SCRATCH_ALLOW_SHELL") != "1":
-        await ws.close(code=4403, reason="shell mode disabled (set SCRATCH_ALLOW_SHELL=1)")
+    if await _ws_gate(ws, "pty") is None:
         return
     await ws.accept()
-    _log.info("scratch pty accepted mode=%s peer=%s", mode, gate[0])
-
+    # No COLUMNS/LINES: the PTY winsize is authoritative, so resizes reflow.
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_TUI")}
-    env.update({"TERM": "xterm-256color", "HOME": str(_HOME), "COLUMNS": str(cols), "LINES": str(rows)})
-    cwd = _HOME / "workspace"
-    if not cwd.is_dir():
-        cwd = _HOME
-    bridge = await asyncio.to_thread(
-        PtyBridge.spawn, _pty_argv(mode), cwd=str(cwd), env=env, cols=cols, rows=rows)
-    loop = asyncio.get_running_loop()
-
-    async def pty_to_ws() -> None:
-        try:
-            while True:
-                chunk = await loop.run_in_executor(None, bridge.read, 0.2)
-                if chunk is None:
-                    return
-                if not chunk:
-                    await asyncio.sleep(0.01)
-                    continue
-                await ws.send_bytes(chunk)
-        except Exception:
-            return
-        finally:
-            with contextlib.suppress(Exception):
-                await ws.close()
-
-    reader = asyncio.create_task(pty_to_ws())
-    try:
-        while True:
-            try:
-                msg = await ws.receive()
-            except RuntimeError:
-                break
-            if msg.get("type") == "websocket.disconnect":
-                break
-            raw = msg.get("bytes")
-            if raw is None:
-                text = msg.get("text")
-                raw = text.encode() if isinstance(text, str) else b""
-            if not raw:
-                continue
-            match = _RESIZE_RE.match(raw)
-            if match and match.end() == len(raw):
-                bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
-                continue
-            if not await bridge.write(raw):
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        reader.cancel()
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(bridge.close)
+    env |= {"TERM": "xterm-256color", "HOME": str(_HOME)}
+    cwd = next((d for d in (_HOME / "workspace", _HOME) if d.is_dir()), _HOME)
+    bridge = await asyncio.to_thread(PtyBridge.spawn, _pty_argv(mode), cwd=str(cwd), env=env, cols=cols, rows=rows)
+    await _legacy_pump(ws, bridge)

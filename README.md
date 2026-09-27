@@ -18,15 +18,19 @@ backend adds a few routes under `/api/plugins/hermes-cloud-scratch/`:
 | `GET  /probe` | Report Hermes version, Python, paths, writable dirs, available tools |
 | `GET  /sse` | Emit a few Server-Sent Events to check streaming survives the edge proxy |
 | `POST /venv-test` | Build a venv under `$HERMES_HOME` that can import Hermes, add a third-party package, and report whether both import |
-| `WS   /pty` | Terminal running `hermes chat --cli` (classic CLI, not the TUI) |
-| `GET  /sidecar`, `POST /sidecar/start`, `POST /sidecar/stop` | Manage a throwaway web process (`sidecar/app.py`) bound to 127.0.0.1 inside the container |
+| `WS   /pty` | Terminal running `hermes chat --cli` (classic CLI, not the TUI), or `?mode=shell` |
+| `GET  /sidecar`, `POST /sidecar/start?app=demo\|hermes-web`, `POST /sidecar/stop` | Manage the web process bound to 127.0.0.1 inside the container; the last started app resumes on the next `/web` request after a restart |
 | `ANY  /web/*` | Streaming reverse proxy to that process (HTTP + SSE); sends `X-Forwarded-Prefix` |
 | `POST /wheel?filename=…` | Install an uploaded wheel into the scratch venv (keeps private packages off GitHub). Behind the dashboard login; it installs and therefore runs arbitrary code, by design |
 
 All routes sit behind the dashboard's own auth gate (HTTP) or reuse the
-dashboard's WebSocket ticket gate (`/pty`). An optional `bash` shell on `/pty`
-exists only when the instance env sets `SCRATCH_ALLOW_SHELL=1`; it is off by
-default.
+dashboard's WebSocket ticket gate (`/pty`). They run code on the instance by
+design (`/pty?mode=shell`, `/wheel`, `/venv-test`, and the CLI agent's own shell
+tools) — the same trust as the dashboard login itself.
+
+The `/web` sidecar is same-origin with the dashboard: the proxy only forwards and
+accepts the app's own `hermes_web*` cookies, but any script the sidecar serves runs
+with the dashboard's cookies in scope, so treat an XSS there as a dashboard compromise.
 
 `client/scratch.py` is a local CLI (run with `uv run`) that logs in through the
 dashboard's native-app OAuth flow, runs `/api/console` commands, calls the

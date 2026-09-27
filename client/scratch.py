@@ -1,23 +1,21 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = ["websockets>=13", "httpx>=0.27"]
 # ///
 """Local client for one Hermes Cloud instance — personal test scaffolding, do not use.
 
     uv run client/scratch.py --url https://<name>.agents.nousresearch.com login
     uv run client/scratch.py console "plugins list"
-    uv run client/scratch.py probe
-    uv run client/scratch.py sse
-    uv run client/scratch.py venv-test [package]
+    uv run client/scratch.py http GET probe
+    uv run client/scratch.py http GET sse --stream
+    uv run client/scratch.py http POST "sidecar/start?app=hermes-web"
     uv run client/scratch.py term            # classic `hermes chat --cli` via the scratch plugin
     uv run client/scratch.py term --tui      # stock /api/pty (hermes --tui)
-    uv run client/scratch.py term --shell    # bash (needs SCRATCH_ALLOW_SHELL=1 on the instance)
+    uv run client/scratch.py term --shell    # a login shell on the instance
 
 The URL is remembered after the first `--url`. Tokens live in
 ~/.config/hermes-cloud-scratch/ (0600).
 """
-
-from __future__ import annotations
 
 import argparse
 import asyncio
@@ -56,8 +54,9 @@ def _load() -> dict:
 def _save(state: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    os.chmod(tmp, 0o600)
+    # Created 0600 from the start: tokens are never world-readable, even briefly.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(state, f, indent=2)
     tmp.replace(STATE_FILE)
 
 
@@ -65,9 +64,8 @@ def _base_url(args, state: dict) -> str:
     url = (args.url or state.get("url") or "").rstrip("/")
     if not url:
         sys.exit("No instance URL yet — pass --url https://<name>.agents.nousresearch.com")
-    if args.url and args.url.rstrip("/") != state.get("url"):
-        state = {"url": url}  # new instance: drop tokens bound to the old one
-        _save(state)
+    if args.url and url != state.get("url"):
+        _save({"url": url})  # new instance: drop tokens bound to the old one
     return url
 
 
@@ -82,6 +80,8 @@ def login(base: str) -> None:
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
+            if not self.path.startswith("/callback"):
+                return self.send_error(404)
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             result.update({k: v[0] for k, v in qs.items()})
             self.send_response(200)
@@ -93,19 +93,19 @@ def login(base: str) -> None:
         def log_message(self, *_):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    query = urllib.parse.urlencode({
-        "provider": "nous", "code_challenge": challenge, "code_challenge_method": "S256",
-        "redirect_uri": redirect_uri, "state": state_param})
-    auth_url = f"{base}/auth/native/authorize?{query}"
-    print(f"Opening browser for Nous Portal sign-in…\n  {auth_url}")
-    webbrowser.open(auth_url)
-    if not done.wait(timeout=300):
-        server.shutdown()
-        sys.exit("Timed out waiting for the sign-in callback.")
-    server.shutdown()
+    with http.server.HTTPServer(("127.0.0.1", 0), Handler) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            query = urllib.parse.urlencode({
+                "provider": "nous", "code_challenge": challenge, "code_challenge_method": "S256",
+                "redirect_uri": f"http://127.0.0.1:{server.server_port}/callback", "state": state_param})
+            auth_url = f"{base}/auth/native/authorize?{query}"
+            print(f"Opening browser for Nous Portal sign-in…\n  {auth_url}")
+            webbrowser.open(auth_url)
+            if not done.wait(timeout=300):
+                sys.exit("Timed out waiting for the sign-in callback.")
+        finally:
+            server.shutdown()
     if result.get("state") != state_param or "code" not in result:
         sys.exit(f"Bad callback: {result}")
     resp = httpx.post(f"{base}/auth/native/token", json={"code": result["code"], "code_verifier": verifier}, timeout=30)
@@ -135,10 +135,10 @@ def _access_token(base: str, *, force_refresh: bool = False) -> str:
     return tokens["access_token"]
 
 
-def _request(base: str, method: str, path: str, **kw) -> httpx.Response:
+def _request(base: str, method: str, path: str, *, timeout: float = 60, **kw) -> httpx.Response:
     for attempt in range(2):
         headers = {"Authorization": f"Bearer {_access_token(base, force_refresh=attempt == 1)}"}
-        resp = httpx.request(method, f"{base}{path}", headers=headers, timeout=kw.pop("timeout", 60), **kw)
+        resp = httpx.request(method, f"{base}{path}", headers=headers, timeout=timeout, **kw)
         if resp.status_code != 401:
             return resp
     return resp
@@ -152,8 +152,7 @@ def _ws_ticket(base: str) -> str:
 
 def _ws_url(base: str, path: str, **params) -> str:
     params["ticket"] = _ws_ticket(base)
-    scheme = "wss" if base.startswith("https") else "ws"
-    return f"{scheme}{base[base.index(':'):]}{path}?{urllib.parse.urlencode(params)}"
+    return f"{base.replace('http', 'ws', 1)}{path}?{urllib.parse.urlencode(params)}"
 
 
 # --- /api/console --------------------------------------------------------------
@@ -204,9 +203,12 @@ async def term(base: str, path: str, params: dict) -> None:
         try:
             await ws.send(f"\x1b[RESIZE:{cols};{rows}]")
 
+            pending: set[asyncio.Task] = set()  # keep resize sends referenced until done
+
             def on_resize(*_):
                 c, r = shutil.get_terminal_size((120, 32))
-                asyncio.ensure_future(ws.send(f"\x1b[RESIZE:{c};{r}]"))
+                pending.add(task := loop.create_task(ws.send(f"\x1b[RESIZE:{c};{r}]")))
+                task.add_done_callback(pending.discard)
 
             loop.add_signal_handler(signal.SIGWINCH, on_resize)
             queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -237,6 +239,26 @@ async def term(base: str, path: str, params: dict) -> None:
     print(f"\r\n[disconnected: {code} {reason or ''}]")
 
 
+# --- plugin HTTP -----------------------------------------------------------------
+
+def http_cmd(base: str, args) -> None:
+    body = None
+    if args.data:
+        body = Path(args.data[1:]).read_bytes() if args.data.startswith("@") else args.data.encode()
+    started = time.monotonic()
+    with httpx.stream(args.method.upper(), f"{base}/api/plugins/{PLUGIN}/{args.path.lstrip('/')}",
+                      headers={"Authorization": f"Bearer {_access_token(base)}"}, content=body,
+                      timeout=None, follow_redirects=False) as resp:
+        print(resp.status_code, resp.headers.get("content-type"), resp.headers.get("location") or "")
+        if args.stream:
+            for line in filter(None, resp.iter_lines()):
+                print(f"+{time.monotonic() - started:5.2f}s  {line}")
+        elif resp.read() and resp.headers.get("content-type", "").startswith("application/json"):
+            print(json.dumps(resp.json(), indent=2))
+        else:
+            print(resp.text[:3000])
+
+
 # --- main -----------------------------------------------------------------------
 
 def main() -> None:
@@ -247,11 +269,6 @@ def main() -> None:
     c = sub.add_parser("console")
     c.add_argument("line")
     c.add_argument("--yes", action="store_true", help="auto-confirm a mutating command")
-    sub.add_parser("probe")
-    s = sub.add_parser("sse")
-    s.add_argument("--count", type=int, default=5)
-    v = sub.add_parser("venv-test")
-    v.add_argument("package", nargs="?", default="starhtml")
     h = sub.add_parser("http", help="authed request to a plugin path, e.g. `http POST sidecar/start`")
     h.add_argument("method")
     h.add_argument("path", help="relative to /api/plugins/hermes-cloud-scratch/")
@@ -263,53 +280,18 @@ def main() -> None:
     g.add_argument("--shell", action="store_true", help="bash via the scratch plugin")
     args = p.parse_args()
 
-    state = _load()
-    base = _base_url(args, state)
-    if args.cmd == "login":
-        login(base)
-    elif args.cmd == "console":
-        sys.exit(asyncio.run(console(base, args.line, args.yes)))
-    elif args.cmd == "probe":
-        resp = _request(base, "GET", f"/api/plugins/{PLUGIN}/probe")
-        print(resp.status_code)
-        print(json.dumps(resp.json(), indent=2) if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:2000])
-    elif args.cmd == "sse":
-        headers = {"Authorization": f"Bearer {_access_token(base)}", "Accept": "text/event-stream"}
-        started = time.time()
-        with httpx.stream("GET", f"{base}/api/plugins/{PLUGIN}/sse", params={"count": args.count},
-                          headers=headers, timeout=None) as resp:
-            print(resp.status_code, resp.headers.get("content-type"))
-            for line in resp.iter_lines():
-                if line:
-                    print(f"+{time.time() - started:5.2f}s  {line}")
-    elif args.cmd == "venv-test":
-        resp = _request(base, "POST", f"/api/plugins/{PLUGIN}/venv-test", params={"package": args.package}, timeout=600)
-        print(resp.status_code)
-        print(json.dumps(resp.json(), indent=2) if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:2000])
-    elif args.cmd == "http":
-        url = f"{base}/api/plugins/{PLUGIN}/{args.path.lstrip('/')}"
-        body = None
-        if args.data:
-            body = Path(args.data[1:]).read_bytes() if args.data.startswith("@") else args.data.encode()
-        headers = {"Authorization": f"Bearer {_access_token(base)}"}
-        started = time.time()
-        with httpx.stream(args.method.upper(), url, headers=headers, content=body, timeout=None,
-                          follow_redirects=False) as resp:
-            print(resp.status_code, resp.headers.get("content-type"), resp.headers.get("location") or "")
-            if args.stream:
-                for line in resp.iter_lines():
-                    if line:
-                        print(f"+{time.time() - started:5.2f}s  {line}")
-            else:
-                resp.read()
-                ctype = resp.headers.get("content-type", "")
-                print(json.dumps(resp.json(), indent=2) if ctype.startswith("application/json") else resp.text[:3000])
-    elif args.cmd == "term":
-        if args.tui:
+    base = _base_url(args, _load())
+    match args.cmd:
+        case "login":
+            login(base)
+        case "console":
+            sys.exit(asyncio.run(console(base, args.line, args.yes)))
+        case "http":
+            http_cmd(base, args)
+        case "term" if args.tui:
             asyncio.run(term(base, "/api/pty", {}))
-        else:
+        case "term":
             asyncio.run(term(base, f"/api/plugins/{PLUGIN}/pty", {"mode": "shell" if args.shell else "cli"}))
-
 
 if __name__ == "__main__":
     main()

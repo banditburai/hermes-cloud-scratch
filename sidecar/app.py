@@ -6,10 +6,9 @@ dashboard -> plugin -> sidecar hop, and what breaks when an app that assumes it
 lives at "/" is served under /api/plugins/<name>/web/.
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
+import html
 import json
 import os
 import time
@@ -17,14 +16,14 @@ import time
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 CSS = "body{font-family:system-ui;margin:2rem;max-width:48rem} .ok{color:#1a7f37} .bad{color:#cf222e} pre{background:#f6f8fa;padding:1rem}"
 
 
 def _prefix(request: Request) -> str:
-    return request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    return html.escape(request.headers.get("x-forwarded-prefix", "").rstrip("/"))
 
 
 async def index(request: Request):
@@ -49,7 +48,7 @@ async def index(request: Request):
 
 
 async def css(_request: Request):
-    return PlainTextResponse(CSS, media_type="text/css")
+    return Response(CSS, media_type="text/css")
 
 
 async def whoami(request: Request):
@@ -65,8 +64,11 @@ async def echo(request: Request):
 
 
 async def sse(request: Request):
-    count = max(1, min(int(request.query_params.get("count", 5)), 120))
-    interval = max(0.05, min(float(request.query_params.get("interval", 1.0)), 10.0))
+    try:
+        count = max(1, min(int(request.query_params.get("count", 5)), 120))
+        interval = max(0.05, min(float(request.query_params.get("interval", 1.0)), 10.0))
+    except ValueError:
+        return JSONResponse({"error": "count and interval must be numbers"}, status_code=400)
 
     async def events():
         for i in range(count):
