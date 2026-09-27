@@ -3,8 +3,8 @@
   Entry and re-auth page for the /web sidecar (hermes-web), served by the dashboard as a plugin
   asset: /dashboard-plugins/hermes-cloud-scratch/web.html. Not under /api/, so an expired
   session gets the dashboard's silent Portal SSO (API routes only get a 401 JSON) and returns
-  here with ?next intact; and not a dashboard SPA route, so none of the dashboard is drawn.
-  ?next=<path under /web/> (validated), else the /web/ root.
+  here with its query intact; and not a dashboard SPA route, so none of the dashboard is drawn.
+  ?next_b64=<base64url path> or ?next=<path>, validated to stay under /web/; else the /web/ root.
 -->
 <html lang="en">
 <head>
@@ -21,21 +21,26 @@
     const base = location.pathname.slice(0, location.pathname.lastIndexOf(ASSET));
     const web = new URL(base + WEB, location.origin);
     let target = web.pathname;
-    // Known loss: the dashboard's login round trip decodes next once more than it encodes it,
-    // so a next with several query params keeps only the first (hermes-web URLs carry at most one).
-    const next = new URLSearchParams(location.search).get("next");
-    if (next) {
-      try {
-        // Resolve, then check: rejects other origins, //host, "..", and paths outside /web/.
-        const url = new URL(next, web);
-        if (url.origin === web.origin && url.pathname.startsWith(web.pathname)) {
-          target = url.pathname + url.search + url.hash;
-        }
-      } catch {
-        /* malformed: the root */
+    try {
+      // Resolve, then check: rejects other origins, //host, "..", and paths outside /web/.
+      const url = new URL(requested(), web);
+      if (url.origin === web.origin && url.pathname.startsWith(web.pathname)) {
+        target = url.pathname + url.search + url.hash;
       }
+    } catch {
+      /* none or malformed: the root */
     }
     location.replace(target);
+
+    // hermes-web's re-auth sends ?next_b64=<base64url path>: no "%" or "&" for the dashboard's
+    // login round trip to decode once too often (it would split a nested query). A plain
+    // ?next=<path> is for hand-written links and the forwarders.
+    function requested() {
+      const params = new URLSearchParams(location.search);
+      const b64 = params.get("next_b64");
+      if (!b64) return params.get("next") ?? "";
+      return atob(b64.replaceAll("-", "+").replaceAll("_", "/")); // ASCII: a serialized path + query
+    }
   })();
 </script>
 </head>
