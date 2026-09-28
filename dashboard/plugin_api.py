@@ -214,10 +214,20 @@ class _Sidecar:
     app: App | None = None
     proc: subprocess.Popen | None = None
     port: int | None = None
+    stopping: asyncio.Task | None = None  # a stop letting running turns finish
 
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    @property
+    def draining(self) -> bool:
+        return self.stopping is not None and not self.stopping.done()
+
+
+# On SIGTERM hermes-web lets running turns finish for up to 180 s before it exits
+# (a second SIGTERM exits it at once); a stop waits that long, and a little more.
+_DRAIN_S = 200
 
 
 _sidecar = _Sidecar()
@@ -271,14 +281,32 @@ def _killpg(pid: int, sig: signal.Signals) -> None:
         os.killpg(pid, sig)
 
 
-async def _terminate(pid: int, proc: subprocess.Popen | None = None) -> None:
-    """SIGTERM the sidecar's whole process group (hermes-web spawns workers), then SIGKILL."""
-    _killpg(pid, signal.SIGTERM)
+def _kill(pid: int, sig: signal.Signals) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, sig)
+
+
+async def _wait_exit(pid: int, proc: subprocess.Popen | None, timeout: float) -> None:
     if proc is not None:
         with contextlib.suppress(subprocess.TimeoutExpired):
-            await asyncio.to_thread(proc.wait, 10)
-    else:
-        await asyncio.sleep(2)
+            await asyncio.to_thread(proc.wait, timeout)
+        return
+    deadline = time.monotonic() + timeout
+    while _is_sidecar(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+
+
+async def _terminate(pid: int, proc: subprocess.Popen | None = None, *, drain: bool = True) -> None:
+    """Stop the sidecar. SIGTERM goes to the app alone, so hermes-web can let its
+    running turns finish (its profile workers keep serving them) — or twice, to
+    exit at once. Then the rest of its process group goes: SIGTERM, then SIGKILL."""
+    _kill(pid, signal.SIGTERM)
+    if not drain:
+        await asyncio.sleep(0.2)  # two signals too close together can arrive as one
+        _kill(pid, signal.SIGTERM)
+    await _wait_exit(pid, proc, _DRAIN_S if drain else 10)
+    _killpg(pid, signal.SIGTERM)
+    await asyncio.sleep(1)
     _killpg(pid, signal.SIGKILL)
 
 
@@ -297,15 +325,20 @@ def _log_tail(n: int = 1500) -> str:
 
 def _status() -> dict:
     proc = _sidecar.proc
-    return {"running": _sidecar.running, "app": _sidecar.app, "pid": proc and proc.pid,
+    return {"running": _sidecar.running, "stopping": _sidecar.draining, "app": _sidecar.app, "pid": proc and proc.pid,
             "returncode": proc and proc.poll(), "port": _sidecar.port, "argv": proc and proc.args,
             "log_tail": _log_tail()}  # fmt: skip
 
 
-async def _stop_locked() -> None:
+async def _stop_locked(*, drain: bool = True) -> None:
     if _sidecar.running:
-        await _terminate(_sidecar.proc.pid, _sidecar.proc)
+        await _terminate(_sidecar.proc.pid, _sidecar.proc, drain=drain)
     _sidecar.proc = None
+
+
+async def _stop(*, drain: bool) -> None:
+    async with _sidecar_lock:
+        await _stop_locked(drain=drain)  # the saved app stays: /web resumes it after a restart
 
 
 async def _start_locked(app: App) -> dict:
@@ -314,7 +347,7 @@ async def _start_locked(app: App) -> dict:
             return _status()
         await _stop_locked()
     if (stale := _saved_state().get("pid")) and _sidecar.proc is None and _is_sidecar(stale):
-        await _terminate(stale)  # orphan from before a dashboard restart
+        await _terminate(stale, drain=False)  # orphan from before a dashboard restart
     argv = [str(_VENV_PY), *_argv(app), "--port", str(port := _free_port())]
     with _SIDECAR_LOG.open("ab") as log:
         proc = subprocess.Popen(argv, cwd=_SCRATCH, stdout=log, stderr=log, start_new_session=True,
@@ -340,6 +373,9 @@ async def sidecar_status():
 
 @router.post("/sidecar/start")
 async def sidecar_start(app: App = "demo"):
+    if _sidecar.draining:
+        return JSONResponse({**_status(), "error": "still stopping: running turns are finishing; retry shortly"},
+                            status_code=409)  # fmt: skip
     if not _VENV_PY.exists():
         return JSONResponse({"running": False, "error": "venv missing; POST /venv-test first"}, status_code=409)
     async with _sidecar_lock:
@@ -350,9 +386,17 @@ async def sidecar_start(app: App = "demo"):
 
 
 @router.post("/sidecar/stop")
-async def sidecar_stop():
-    async with _sidecar_lock:
-        await _stop_locked()  # the saved app stays: /web resumes it after a restart
+async def sidecar_stop(drain: bool = True):
+    """Stop the sidecar. By default running turns finish first (up to ``_DRAIN_S``):
+    the stop carries on in the background and ``GET /sidecar`` reports ``stopping``
+    until it's done. ``drain=false`` stops at once (and cuts a drain short)."""
+    if _sidecar.draining:
+        if not drain and _sidecar.proc is not None:
+            _kill(_sidecar.proc.pid, signal.SIGTERM)  # hermes-web's second signal: exit now
+    else:
+        _sidecar.stopping = asyncio.create_task(_stop(drain=drain))
+    if not drain:
+        await _sidecar.stopping
     return _status()
 
 
