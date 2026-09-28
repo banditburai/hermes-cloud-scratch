@@ -345,7 +345,7 @@ async def _start_locked(app: App) -> dict:
     if _sidecar.running:
         if _sidecar.app == app:
             return _status()
-        await _stop_locked()
+        await _stop_locked(drain=False)  # switching apps: the caller is waiting on this request
     if (stale := _saved_state().get("pid")) and _sidecar.proc is None and _is_sidecar(stale):
         await _terminate(stale, drain=False)  # orphan from before a dashboard restart
     argv = [str(_VENV_PY), *_argv(app), "--port", str(port := _free_port())]
@@ -395,9 +395,16 @@ async def sidecar_stop(drain: bool = True):
             _kill(_sidecar.proc.pid, signal.SIGTERM)  # hermes-web's second signal: exit now
     else:
         _sidecar.stopping = asyncio.create_task(_stop(drain=drain))
+        _sidecar.stopping.add_done_callback(_log_stop_failure)
     if not drain:
-        await _sidecar.stopping
+        # shielded: a client that hangs up mustn't cancel the stop half-way
+        await asyncio.shield(_sidecar.stopping)
     return _status()
+
+
+def _log_stop_failure(task: asyncio.Task) -> None:
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        _log.error("sidecar stop failed: %s", exc, exc_info=exc)
 
 
 @router.api_route("/web", methods=["GET", "HEAD"])
